@@ -1,0 +1,10 @@
+version: '2.1'
+
+services:
+  k8s-job-cleaner-go:
+    image: k8s-job-cleaner-go
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+        - 3000:3000

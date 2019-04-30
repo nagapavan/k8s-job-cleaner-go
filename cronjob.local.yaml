@@ -1,0 +1,31 @@
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: k8s-job-cleaner-go
+  labels:
+    job: k8s-job-cleaner-go
+    role: job
+spec:
+  schedule: "0 * * * *"
+  startingDeadlineSeconds: 30
+  concurrencyPolicy: Allow
+  suspend: false
+  jobTemplate:
+    metadata:
+      name: k8s-job-cleaner-go
+      labels:
+        job: k8s-job-cleaner-go
+        role: job
+    spec:
+      template:
+        metadata:
+          name: k8s-job-cleaner-go
+          labels:
+            job: k8s-job-cleaner-go
+            role: job
+        spec:
+          containers:
+          - name: k8s-job-cleaner-go
+            image: knpavankumar/k8s-job-cleaner-go:v1
+            imagePullPolicy: Never
+          restartPolicy: Never
