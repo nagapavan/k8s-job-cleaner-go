@@ -43,13 +43,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: knpavankumar/k8s-job-cleaner-go:$(date +%s)
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v5
