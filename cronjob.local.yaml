@@ -65,7 +65,7 @@ spec:
               args:
                 - --succeeded-ttl=1h
                 - --failed-ttl=24h
-                # - --log-level=debug
+                # - --verbose
                 # - --dry-run
               securityContext:
                 allowPrivilegeEscalation: false

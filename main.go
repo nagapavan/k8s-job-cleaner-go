@@ -20,7 +20,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// config holds the runtime options of the cleaner.
 type config struct {
 	namespace         string
 	excludeNamespaces map[string]bool
@@ -30,70 +29,32 @@ type config struct {
 	maxCount          int
 	succeededTTL      time.Duration
 	failedTTL         time.Duration
-	logLevel          string
-	logFormat         string
 }
 
-// decision describes whether a resource should be deleted and why.
+// decision is the outcome of evaluating one Job or Pod.
 type decision struct {
 	deletable bool
 	reason    string
-	state     string
-	age       time.Duration
-	ttl       time.Duration
-}
-
-// stats tracks evaluation outcomes for summary audit logging.
-type stats struct {
-	total             int
-	deleted           int
-	failedDeletes     int
-	skippedNamespace  int
-	skippedActive     int
-	skippedNativeTTL  int
-	skippedJobOwned   int
-	skippedRetention  int
-	skippedMaxReached int
+	age, ttl  time.Duration
 }
 
 func parseNamespaceSet(csv string) map[string]bool {
 	set := make(map[string]bool)
 	for _, s := range strings.Split(csv, ",") {
-		s = strings.TrimSpace(s)
-		if s != "" {
+		if s = strings.TrimSpace(s); s != "" {
 			set[s] = true
 		}
 	}
 	return set
 }
 
-func setupLogger(levelStr, format string) error {
-	var level slog.Level
-	switch strings.ToLower(strings.TrimSpace(levelStr)) {
-	case "debug":
-		level = slog.LevelDebug
-	case "info", "":
-		level = slog.LevelInfo
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		return fmt.Errorf("invalid log-level %q (expected debug, info, warn, error)", levelStr)
+// expired compares the time since finishedAt against ttl.
+func expired(finishedAt time.Time, ttl time.Duration, now time.Time) decision {
+	age := max(now.Sub(finishedAt), 0)
+	if age < ttl {
+		return decision{reason: "within_retention_ttl", age: age, ttl: ttl}
 	}
-
-	opts := &slog.HandlerOptions{Level: level}
-	var handler slog.Handler
-	switch strings.ToLower(strings.TrimSpace(format)) {
-	case "json":
-		handler = slog.NewJSONHandler(os.Stdout, opts)
-	case "text", "":
-		handler = slog.NewTextHandler(os.Stdout, opts)
-	default:
-		return fmt.Errorf("invalid log-format %q (expected text or json)", format)
-	}
-	slog.SetDefault(slog.New(handler))
-	return nil
+	return decision{deletable: true, reason: "retention_ttl_expired", age: age, ttl: ttl}
 }
 
 // finishedJobState reports whether the job is finished, whether it succeeded,
@@ -103,70 +64,37 @@ func finishedJobState(job *batchv1.Job) (finished, succeeded bool, at time.Time)
 		return false, false, time.Time{}
 	}
 	for _, c := range job.Status.Conditions {
-		if c.Status != corev1.ConditionTrue {
+		if c.Status != corev1.ConditionTrue || (c.Type != batchv1.JobComplete && c.Type != batchv1.JobFailed) {
 			continue
 		}
-		switch c.Type {
-		case batchv1.JobComplete:
-			t := c.LastTransitionTime.Time
-			if t.IsZero() && job.Status.CompletionTime != nil {
-				t = job.Status.CompletionTime.Time
-			}
-			if t.IsZero() {
-				t = job.CreationTimestamp.Time
-			}
-			return true, true, t
-		case batchv1.JobFailed:
-			t := c.LastTransitionTime.Time
-			if t.IsZero() {
-				t = job.CreationTimestamp.Time
-			}
-			return true, false, t
+		at = c.LastTransitionTime.Time
+		if at.IsZero() && job.Status.CompletionTime != nil {
+			at = job.Status.CompletionTime.Time
 		}
-	}
-	if job.Status.Succeeded > 0 {
-		t := job.CreationTimestamp.Time
-		if job.Status.CompletionTime != nil && !job.Status.CompletionTime.Time.IsZero() {
-			t = job.Status.CompletionTime.Time
+		if at.IsZero() {
+			at = job.CreationTimestamp.Time
 		}
-		return true, true, t
+		return true, c.Type == batchv1.JobComplete, at
 	}
 	return false, false, time.Time{}
 }
 
-// evaluateJob inspects a Job and returns a transparent decision on whether to delete it.
 func evaluateJob(job *batchv1.Job, cfg config, now time.Time) decision {
-	if cfg.excludeNamespaces[job.Namespace] {
-		return decision{deletable: false, reason: "excluded_namespace", state: "Ignored"}
-	}
-	if !cfg.ignoreNativeTTL && job.Spec.TTLSecondsAfterFinished != nil {
-		return decision{deletable: false, reason: "managed_by_native_ttl", state: "NativeTTL"}
+	switch {
+	case cfg.excludeNamespaces[job.Namespace]:
+		return decision{reason: "excluded_namespace"}
+	case !cfg.ignoreNativeTTL && job.Spec.TTLSecondsAfterFinished != nil:
+		return decision{reason: "managed_by_native_ttl"}
 	}
 	finished, succeeded, at := finishedJobState(job)
 	if !finished {
-		return decision{deletable: false, reason: "active_or_incomplete", state: "Active"}
+		return decision{reason: "active_or_incomplete"}
 	}
-
-	state := "Failed"
 	ttl := cfg.failedTTL
 	if succeeded {
-		state = "Succeeded"
 		ttl = cfg.succeededTTL
 	}
-
-	age := now.Sub(at)
-	if age < 0 {
-		age = 0
-	}
-	if age < ttl {
-		return decision{deletable: false, reason: "within_retention_ttl", state: state, age: age, ttl: ttl}
-	}
-	return decision{deletable: true, reason: "retention_ttl_expired", state: state, age: age, ttl: ttl}
-}
-
-// isDeletableJob returns true when the job finished and exceeded its retention TTL.
-func isDeletableJob(job *batchv1.Job, cfg config, now time.Time) bool {
-	return evaluateJob(job, cfg, now).deletable
+	return expired(at, ttl, now)
 }
 
 func isOwnedByJob(pod *corev1.Pod) bool {
@@ -178,34 +106,27 @@ func isOwnedByJob(pod *corev1.Pod) bool {
 	return false
 }
 
-// podFinishedAt returns the best-known time a terminated pod finished.
+// podFinishedAt returns the latest container termination time, falling back to creation time.
 func podFinishedAt(pod *corev1.Pod) time.Time {
-	var latest time.Time
-	for _, cs := range pod.Status.InitContainerStatuses {
-		if t := cs.State.Terminated; t != nil && t.FinishedAt.Time.After(latest) {
-			latest = t.FinishedAt.Time
+	latest := pod.CreationTimestamp.Time
+	var found bool
+	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+		for _, cs := range statuses {
+			if t := cs.State.Terminated; t != nil && (!found || t.FinishedAt.Time.After(latest)) {
+				latest, found = t.FinishedAt.Time, true
+			}
 		}
-	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if t := cs.State.Terminated; t != nil && t.FinishedAt.Time.After(latest) {
-			latest = t.FinishedAt.Time
-		}
-	}
-	if latest.IsZero() {
-		latest = pod.CreationTimestamp.Time
 	}
 	return latest
 }
 
-// evaluatePod inspects a Pod and returns a transparent decision on whether to delete it.
 func evaluatePod(pod *corev1.Pod, cfg config, now time.Time) decision {
 	if cfg.excludeNamespaces[pod.Namespace] {
-		return decision{deletable: false, reason: "excluded_namespace", state: string(pod.Status.Phase)}
+		return decision{reason: "excluded_namespace"}
 	}
 	if isOwnedByJob(pod) {
-		return decision{deletable: false, reason: "owned_by_job", state: string(pod.Status.Phase)}
+		return decision{reason: "owned_by_job"}
 	}
-
 	var ttl time.Duration
 	switch pod.Status.Phase {
 	case corev1.PodSucceeded:
@@ -213,227 +134,99 @@ func evaluatePod(pod *corev1.Pod, cfg config, now time.Time) decision {
 	case corev1.PodFailed:
 		ttl = cfg.failedTTL
 	default:
-		return decision{deletable: false, reason: "active_or_non_terminal", state: string(pod.Status.Phase)}
+		return decision{reason: "not_terminated"}
 	}
-
-	age := now.Sub(podFinishedAt(pod))
-	if age < 0 {
-		age = 0
-	}
-	if age < ttl {
-		return decision{deletable: false, reason: "within_retention_ttl", state: string(pod.Status.Phase), age: age, ttl: ttl}
-	}
-	return decision{deletable: true, reason: "retention_ttl_expired", state: string(pod.Status.Phase), age: age, ttl: ttl}
-}
-
-// isDeletablePod returns true for terminated standalone pods that exceeded their retention TTL.
-func isDeletablePod(pod *corev1.Pod, cfg config, now time.Time) bool {
-	return evaluatePod(pod, cfg, now).deletable
+	return expired(podFinishedAt(pod), ttl, now)
 }
 
 func buildClient(kubeconfig string) (kubernetes.Interface, string, error) {
-	cfg, err := rest.InClusterConfig()
-	if err == nil {
-		cs, err := kubernetes.NewForConfig(cfg)
-		return cs, "in-cluster", err
-	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if kubeconfig != "" {
+	restCfg, err := rest.InClusterConfig()
+	mode := "in-cluster"
+	if err != nil {
+		rules := clientcmd.NewDefaultClientConfigLoadingRules()
 		rules.ExplicitPath = kubeconfig
-	}
-	cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		rules, &clientcmd.ConfigOverrides{}).ClientConfig()
-	if err != nil {
-		return nil, "", fmt.Errorf("no in-cluster or kubeconfig configuration: %w", err)
-	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	return cs, "kubeconfig", err
-}
-
-func cleanJobs(ctx context.Context, cs kubernetes.Interface, cfg config, now time.Time) (stats, error) {
-	var st stats
-	jobs, err := cs.BatchV1().Jobs(cfg.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return st, fmt.Errorf("listing jobs: %w", err)
-	}
-	st.total = len(jobs.Items)
-	slog.Info("listed jobs for evaluation", "total", st.total, "namespace", cfg.namespace)
-
-	policy := metav1.DeletePropagationBackground
-	for i := range jobs.Items {
-		job := &jobs.Items[i]
-		dec := evaluateJob(job, cfg, now)
-		if !dec.deletable {
-			switch dec.reason {
-			case "excluded_namespace":
-				st.skippedNamespace++
-			case "managed_by_native_ttl":
-				st.skippedNativeTTL++
-			case "active_or_incomplete":
-				st.skippedActive++
-			case "within_retention_ttl":
-				st.skippedRetention++
-			}
-			slog.Debug("skipping job",
-				"namespace", job.Namespace,
-				"name", job.Name,
-				"state", dec.state,
-				"reason", dec.reason,
-				"age", dec.age.Round(time.Second),
-				"ttl", dec.ttl,
-			)
-			continue
-		}
-		if st.deleted >= cfg.maxCount {
-			st.skippedMaxReached++
-			slog.Debug("skipping job due to max-count limit",
-				"namespace", job.Namespace,
-				"name", job.Name,
-				"maxCount", cfg.maxCount,
-			)
-			continue
-		}
-
-		slog.Info("deleting job",
-			"namespace", job.Namespace,
-			"name", job.Name,
-			"state", dec.state,
-			"reason", dec.reason,
-			"age", dec.age.Round(time.Second),
-			"ttl", dec.ttl,
-			"dryRun", cfg.dryRun,
-		)
-		if cfg.dryRun {
-			st.deleted++
-			continue
-		}
-		err := cs.BatchV1().Jobs(job.Namespace).Delete(ctx, job.Name, metav1.DeleteOptions{PropagationPolicy: &policy})
+		restCfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{}).ClientConfig()
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				slog.Warn("job already deleted concurrently", "namespace", job.Namespace, "name", job.Name)
-				continue
-			}
-			st.failedDeletes++
-			slog.Error("failed to delete job", "namespace", job.Namespace, "name", job.Name, "error", err)
-			continue
+			return nil, "", fmt.Errorf("no in-cluster or kubeconfig configuration: %w", err)
 		}
-		st.deleted++
+		mode = "kubeconfig"
 	}
-
-	slog.Info("job cleanup summary",
-		"totalScanned", st.total,
-		"deleted", st.deleted,
-		"failedDeletes", st.failedDeletes,
-		"skippedActive", st.skippedActive,
-		"skippedWithinTTL", st.skippedRetention,
-		"skippedNativeTTL", st.skippedNativeTTL,
-		"skippedExcludedNamespace", st.skippedNamespace,
-		"skippedMaxCount", st.skippedMaxReached,
-		"dryRun", cfg.dryRun,
-	)
-	return st, nil
+	cs, err := kubernetes.NewForConfig(restCfg)
+	return cs, mode, err
 }
 
-func cleanPods(ctx context.Context, cs kubernetes.Interface, cfg config, now time.Time) (stats, error) {
-	var st stats
-	pods, err := cs.CoreV1().Pods(cfg.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return st, fmt.Errorf("listing pods: %w", err)
-	}
-	st.total = len(pods.Items)
-	slog.Info("listed pods for evaluation", "total", st.total, "namespace", cfg.namespace)
+// sweep evaluates n items, deletes the deletable ones (up to cfg.maxCount) and
+// logs every action plus a summary. It returns the number deleted.
+func sweep(kind string, n int, cfg config,
+	eval func(i int) (namespace, name string, d decision),
+	del func(i int) error) int {
 
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		dec := evaluatePod(pod, cfg, now)
-		if !dec.deletable {
-			switch dec.reason {
-			case "excluded_namespace":
-				st.skippedNamespace++
-			case "owned_by_job":
-				st.skippedJobOwned++
-			case "active_or_non_terminal":
-				st.skippedActive++
-			case "within_retention_ttl":
-				st.skippedRetention++
-			}
-			slog.Debug("skipping pod",
-				"namespace", pod.Namespace,
-				"name", pod.Name,
-				"phase", dec.state,
-				"reason", dec.reason,
-				"age", dec.age.Round(time.Second),
-				"ttl", dec.ttl,
-			)
+	var deleted, failed int
+	skipped := map[string]int{}
+	for i := 0; i < n; i++ {
+		ns, name, d := eval(i)
+		attrs := []any{"namespace", ns, "name", name, "reason", d.reason, "age", d.age.Round(time.Second), "ttl", d.ttl}
+		if !d.deletable {
+			skipped[d.reason]++
+			slog.Debug("skipping "+kind, attrs...)
 			continue
 		}
-		if st.deleted >= cfg.maxCount {
-			st.skippedMaxReached++
-			slog.Debug("skipping pod due to max-count limit",
-				"namespace", pod.Namespace,
-				"name", pod.Name,
-				"maxCount", cfg.maxCount,
-			)
+		if deleted >= cfg.maxCount {
+			skipped["max_count_reached"]++
+			slog.Debug("skipping "+kind, "namespace", ns, "name", name, "reason", "max_count_reached")
 			continue
 		}
-
-		slog.Info("deleting pod",
-			"namespace", pod.Namespace,
-			"name", pod.Name,
-			"phase", dec.state,
-			"reason", dec.reason,
-			"age", dec.age.Round(time.Second),
-			"ttl", dec.ttl,
-			"dryRun", cfg.dryRun,
-		)
-		if cfg.dryRun {
-			st.deleted++
-			continue
-		}
-		if err := cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
-			if apierrors.IsNotFound(err) {
-				slog.Warn("pod already deleted concurrently", "namespace", pod.Namespace, "name", pod.Name)
+		slog.Info("deleting "+kind, append(attrs, "dryRun", cfg.dryRun)...)
+		if !cfg.dryRun {
+			if err := del(i); apierrors.IsNotFound(err) {
+				slog.Warn(kind+" already gone", "namespace", ns, "name", name)
+				continue
+			} else if err != nil {
+				failed++
+				slog.Error("failed to delete "+kind, "namespace", ns, "name", name, "error", err)
 				continue
 			}
-			st.failedDeletes++
-			slog.Error("failed to delete pod", "namespace", pod.Namespace, "name", pod.Name, "error", err)
-			continue
 		}
-		st.deleted++
+		deleted++
 	}
-
-	slog.Info("pod cleanup summary",
-		"totalScanned", st.total,
-		"deleted", st.deleted,
-		"failedDeletes", st.failedDeletes,
-		"skippedActive", st.skippedActive,
-		"skippedWithinTTL", st.skippedRetention,
-		"skippedJobOwned", st.skippedJobOwned,
-		"skippedExcludedNamespace", st.skippedNamespace,
-		"skippedMaxCount", st.skippedMaxReached,
-		"dryRun", cfg.dryRun,
-	)
-	return st, nil
+	slog.Info(kind+" cleanup summary", "scanned", n, "deleted", deleted, "failed", failed, "skipped", skipped, "dryRun", cfg.dryRun)
+	return deleted
 }
 
 func run(ctx context.Context, cs kubernetes.Interface, cfg config) error {
 	start := time.Now()
-	jobStats, err := cleanJobs(ctx, cs, cfg, start)
-	if err != nil {
-		return err
-	}
 
-	podStats, err := cleanPods(ctx, cs, cfg, start)
+	jobs, err := cs.BatchV1().Jobs(cfg.namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("listing jobs: %w", err)
 	}
+	background := metav1.DeletePropagationBackground
+	jobsDeleted := sweep("job", len(jobs.Items), cfg,
+		func(i int) (string, string, decision) {
+			j := &jobs.Items[i]
+			return j.Namespace, j.Name, evaluateJob(j, cfg, start)
+		},
+		func(i int) error {
+			j := &jobs.Items[i]
+			return cs.BatchV1().Jobs(j.Namespace).Delete(ctx, j.Name, metav1.DeleteOptions{PropagationPolicy: &background})
+		})
 
-	slog.Info("cleanup run completed",
-		"duration", time.Since(start).Round(time.Millisecond),
-		"jobsDeleted", jobStats.deleted,
-		"podsDeleted", podStats.deleted,
-		"dryRun", cfg.dryRun,
-	)
+	pods, err := cs.CoreV1().Pods(cfg.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("listing pods: %w", err)
+	}
+	podsDeleted := sweep("pod", len(pods.Items), cfg,
+		func(i int) (string, string, decision) {
+			p := &pods.Items[i]
+			return p.Namespace, p.Name, evaluatePod(p, cfg, start)
+		},
+		func(i int) error {
+			p := &pods.Items[i]
+			return cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{})
+		})
+
+	slog.Info("cleanup run completed", "duration", time.Since(start).Round(time.Millisecond),
+		"jobsDeleted", jobsDeleted, "podsDeleted", podsDeleted, "dryRun", cfg.dryRun)
 	return nil
 }
 
@@ -441,51 +234,36 @@ func main() {
 	var (
 		cfg        config
 		excludeCSV string
+		verbose    bool
 	)
 	flag.StringVar(&cfg.namespace, "namespace", metav1.NamespaceAll, "namespace to clean (default: all namespaces)")
-	flag.StringVar(&excludeCSV, "exclude-namespaces", "kube-system,kube-public,kube-node-lease", "comma-separated namespaces to exclude from cleanup")
+	flag.StringVar(&excludeCSV, "exclude-namespaces", "kube-system,kube-public,kube-node-lease", "comma-separated namespaces to skip")
 	flag.StringVar(&cfg.kubeconfig, "kubeconfig", "", "path to kubeconfig (used when not running in-cluster)")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "log what would be deleted without deleting")
-	flag.BoolVar(&cfg.ignoreNativeTTL, "ignore-native-ttl", false, "also clean jobs that have spec.ttlSecondsAfterFinished set")
+	flag.BoolVar(&cfg.ignoreNativeTTL, "ignore-native-ttl", false, "also clean jobs that set spec.ttlSecondsAfterFinished")
 	flag.IntVar(&cfg.maxCount, "max-count", 100, "maximum number of jobs and of pods to delete per run")
 	flag.DurationVar(&cfg.succeededTTL, "succeeded-ttl", 0, "minimum age after completion before deleting succeeded jobs/pods")
 	flag.DurationVar(&cfg.failedTTL, "failed-ttl", 0, "minimum age after failure before deleting failed jobs/pods")
-	flag.StringVar(&cfg.logLevel, "log-level", "info", "log verbosity level (debug, info, warn, error)")
-	flag.StringVar(&cfg.logFormat, "log-format", "text", "log output format (text or json)")
+	flag.BoolVar(&verbose, "verbose", false, "also log every skipped resource and why")
 	flag.Parse()
 
 	cfg.excludeNamespaces = parseNamespaceSet(excludeCSV)
-
-	if err := setupLogger(cfg.logLevel, cfg.logFormat); err != nil {
-		slog.Error("invalid logger configuration", "error", err)
-		os.Exit(1)
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
 	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cs, authMode, err := buildClient(cfg.kubeconfig)
+	cs, mode, err := buildClient(cfg.kubeconfig)
 	if err != nil {
 		slog.Error("failed to create kubernetes client", "error", err)
 		os.Exit(1)
 	}
-
-	targetNS := cfg.namespace
-	if targetNS == "" {
-		targetNS = "<all>"
-	}
-	slog.Info("starting k8s-job-cleaner-go",
-		"authMode", authMode,
-		"namespace", targetNS,
-		"excludedNamespaces", excludeCSV,
-		"dryRun", cfg.dryRun,
-		"ignoreNativeTTL", cfg.ignoreNativeTTL,
-		"maxCount", cfg.maxCount,
-		"succeededTTL", cfg.succeededTTL,
-		"failedTTL", cfg.failedTTL,
-		"logLevel", cfg.logLevel,
-		"logFormat", cfg.logFormat,
-	)
+	slog.Info("starting", "auth", mode, "namespace", cfg.namespace, "exclude", excludeCSV, "dryRun", cfg.dryRun,
+		"maxCount", cfg.maxCount, "succeededTTL", cfg.succeededTTL, "failedTTL", cfg.failedTTL)
 
 	if err := run(ctx, cs, cfg); err != nil {
 		slog.Error("cleanup failed", "error", err)

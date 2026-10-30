@@ -1,67 +1,52 @@
 # k8s-job-cleaner-go
 
-A lightweight Kubernetes utility to clean up finished (`Complete` or `Failed`) Kubernetes `Jobs` and standalone terminated `Pods` after configurable retention TTLs.
+Deletes finished Kubernetes Jobs and standalone terminated Pods once they are older than a retention TTL. Run it as a CronJob.
 
 Inspired by [dtan4/k8s-job-cleaner](https://github.com/dtan4/k8s-job-cleaner).
 
-## Why Use This?
+Kubernetes can already do this per Job with `spec.ttlSecondsAfterFinished`. This tool is for Jobs you don't control (Helm charts, CI runners) and for keeping failed Jobs longer than succeeded ones.
 
-While modern Kubernetes provides `spec.ttlSecondsAfterFinished` on Jobs and history limits on CronJobs, clusters often accumulate completed/failed Jobs and orphaned Pods from:
-- Third-party Helm charts, CI runners, or legacy manifests that omit `ttlSecondsAfterFinished`.
-- Workloads needing separate retention windows for **Succeeded** jobs (e.g., clean after `1h`) versus **Failed** jobs (e.g., retain for `24h` for debugging).
-- Standalone/orphaned terminated Pods not managed by a parent Job.
+## Behavior
 
-## Features
+- Jobs are deleted with background propagation, so their Pods go with them.
+- Pods owned by a Job are left to that cascade. Only standalone Succeeded/Failed Pods are deleted directly.
+- Jobs that set `spec.ttlSecondsAfterFinished` are skipped (override with `--ignore-native-ttl`).
+- `kube-system`, `kube-public` and `kube-node-lease` are skipped.
+- Uses the in-cluster config, or falls back to your kubeconfig.
+- Logs every deletion and a summary per run. `--verbose` also logs each skip and its reason.
 
-- **Differentiated Retention TTLs**: Separate `--succeeded-ttl` and `--failed-ttl` durations.
-- **Safe Defaults**:
-  - Automatically skips `kube-system`, `kube-public`, and `kube-node-lease` namespaces (`--exclude-namespaces`).
-  - Automatically respects Jobs that already define native `spec.ttlSecondsAfterFinished` (unless `--ignore-native-ttl` is set).
-  - Skips Pods owned by a `Job` during Pod cleanup so `DeletePropagationBackground` handles them cleanly without race conditions.
-- **Transparent Structured Logging**: Built-in `log/slog` logging (`text` or `json`) with per-resource audit reasons (`retention_ttl_expired`, `within_retention_ttl`, `managed_by_native_ttl`, `excluded_namespace`, `owned_by_job`) and end-of-run summary statistics.
-- **Dual Auth Mode**: Automatically uses in-cluster service account config when running inside Kubernetes, falling back to local `KUBECONFIG` / `~/.kube/config` for local runs.
-- **Hardened Container Image**: Multi-arch (`linux/amd64`, `linux/arm64`) static binary running as `nonroot` on `gcr.io/distroless/static-debian12:nonroot`.
-
-## CLI Flags
+## Flags
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--namespace` | `""` (all) | Namespace to clean (default: all namespaces) |
-| `--exclude-namespaces` | `kube-system,kube-public,kube-node-lease` | Comma-separated namespaces to exclude from cleanup |
-| `--succeeded-ttl` | `0s` | Minimum age after completion before deleting succeeded jobs/pods (e.g. `1h`, `30m`) |
-| `--failed-ttl` | `0s` | Minimum age after failure before deleting failed jobs/pods (e.g. `24h`) |
-| `--max-count` | `100` | Maximum number of jobs and of pods to delete per run |
-| `--dry-run` | `false` | Log what would be deleted without performing deletions |
-| `--ignore-native-ttl` | `false` | Also clean jobs that have `spec.ttlSecondsAfterFinished` set |
-| `--log-level` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). Use `debug` to log every skipped resource and reason |
-| `--log-format` | `text` | Log output format (`text` or `json`) |
-| `--kubeconfig` | `""` | Explicit path to kubeconfig file (when running outside cluster) |
+| `--namespace` | all | Namespace to clean |
+| `--exclude-namespaces` | `kube-system,kube-public,kube-node-lease` | Namespaces to skip |
+| `--succeeded-ttl` | `0s` | Min age after completion before deleting |
+| `--failed-ttl` | `0s` | Min age after failure before deleting |
+| `--max-count` | `100` | Max jobs and max pods deleted per run |
+| `--dry-run` | `false` | Log deletions without performing them |
+| `--ignore-native-ttl` | `false` | Also clean Jobs that set their own TTL |
+| `--verbose` | `false` | Log skipped resources |
+| `--kubeconfig` | | Kubeconfig path (outside the cluster) |
 
-## Deployment
+## Deploy
 
-### Standard Kubernetes Cluster
-Includes `ServiceAccount`, `ClusterRole`, `ClusterRoleBinding`, and `batch/v1` `CronJob`:
 ```bash
-kubectl apply -f cronjob.yaml
+kubectl apply -f cronjob.yaml        # RBAC + CronJob
 ```
-See [cronjob.yaml](cronjob.yaml).
 
-### Local Kubernetes Cluster (Docker Desktop / kind / minikube)
-Uses local image with `imagePullPolicy: Never`:
+For a local cluster (Docker Desktop, kind, minikube), build the image and use `cronjob.local.yaml`, which sets `imagePullPolicy: Never`:
+
 ```bash
 docker build -t knpavankumar/k8s-job-cleaner-go:latest .
 kubectl apply -f cronjob.local.yaml
 ```
-See [cronjob.local.yaml](cronjob.local.yaml).
 
-## Local Development & Testing
+## Development
 
-Run locally against your current kubeconfig in dry-run debug mode:
 ```bash
-go run . --dry-run --log-level=debug --succeeded-ttl=1h --failed-ttl=24h
+go run . --dry-run --verbose --succeeded-ttl=1h --failed-ttl=24h
+go test ./...
 ```
 
-Run unit tests:
-```bash
-go test -race -v ./...
-```
+Images are published to Docker Hub on pushes to `main`/`master` (`latest`, `sha-<short>`) and on `vX.Y.Z` tags (`X.Y.Z`, `X.Y`, `X`).

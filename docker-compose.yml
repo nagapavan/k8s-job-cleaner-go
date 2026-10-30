@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     command:
       - --dry-run
-      - --log-level=debug
+      - --verbose
       - --succeeded-ttl=1h
       - --failed-ttl=24h
       - --kubeconfig=/home/nonroot/.kube/config
