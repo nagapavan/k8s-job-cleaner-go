@@ -1,17 +1,21 @@
-#build stage
-FROM golang:alpine AS builder
-RUN apk add --no-cache git
-WORKDIR /go/src/app
-ENV GO111MODULE=on
-COPY . .
-RUN go get -d -v ./...
-RUN go install -v ./...
-RUN go build main.go
+# syntax=docker/dockerfile:1
 
-#final stage
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /go/src/app .
-ENTRYPOINT ./main
-LABEL Name=k8s-job-cleaner-go Version=0.0.1 Maintainer=pavankumarkn@gmail.com
+# build stage
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY main.go ./
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /k8s-job-cleaner .
+
+# final stage
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /k8s-job-cleaner /k8s-job-cleaner
+USER nonroot:nonroot
+ENTRYPOINT ["/k8s-job-cleaner"]
+LABEL org.opencontainers.image.title="k8s-job-cleaner-go" \
+      org.opencontainers.image.source="https://github.com/knpavankumar/k8s-job-cleaner-go" \
+      org.opencontainers.image.authors="pavankumarkn@gmail.com"

@@ -1,8 +1,14 @@
-version: '2.1'
-
 services:
   k8s-job-cleaner-go:
-    image: k8s-job-cleaner-go
-    build: .
-    ports:
-      - 3000:3000
+    image: knpavankumar/k8s-job-cleaner-go:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - --dry-run
+      - --log-level=debug
+      - --succeeded-ttl=1h
+      - --failed-ttl=24h
+      - --kubeconfig=/home/nonroot/.kube/config
+    volumes:
+      - ~/.kube/config:/home/nonroot/.kube/config:ro
