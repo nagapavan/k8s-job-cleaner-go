@@ -1,4 +1,5 @@
 # Binaries for programs and plugins
+/k8s-job-cleaner-go
 *.exe
 *.exe~
 *.dll
@@ -11,5 +12,9 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-vendor/**
-.vscode/**
+# Local environments & IDEs
+vendor/
+.venv/
+.vscode/
+.idea/
+.DS_Store
